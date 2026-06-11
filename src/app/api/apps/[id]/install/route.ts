@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { NextRequest } from 'next/server';
 import { getAppById, updateAppStatus } from '@/lib/apps';
@@ -57,6 +59,48 @@ function streamProcess(command: string, args: string[], cwd: string, emit: (line
   });
 }
 
+async function installPythonRequirements(
+  python: string,
+  requirements: string,
+  vendor: string,
+  emit: (line: string) => void
+) {
+  emit('Upgrading pip, setuptools, and wheel');
+  const bootstrapCode = await streamProcess(
+    python,
+    ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'],
+    path.dirname(requirements),
+    emit
+  );
+
+  if (bootstrapCode !== 0) {
+    return bootstrapCode;
+  }
+
+  emit('Installing Python requirements with binary preference');
+  return streamProcess(
+    python,
+    ['-m', 'pip', 'install', '--prefer-binary', '-r', requirements, '--target', vendor],
+    path.dirname(requirements),
+    emit
+  );
+}
+
+async function createPythonFallbackRequirements(requirementsPath: string) {
+  const original = await fs.readFile(requirementsPath, 'utf8');
+  const filtered = original
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter((line) => !line.startsWith('#'))
+    .map((line) => line.replace(/discord\.py\[voice\]/i, 'discord.py'))
+    .filter((line) => !/^PyNaCl(\b|[<>=])/i.test(line));
+
+  const fallbackPath = path.join(os.tmpdir(), `bluepanel-requirements-${Date.now()}.txt`);
+  await fs.writeFile(fallbackPath, filtered.join('\n') + '\n', 'utf8');
+  return fallbackPath;
+}
+
 export async function POST(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const appId = Number(id);
@@ -85,11 +129,39 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
         const python = process.platform === 'win32' ? 'python' : 'python3';
         const requirements = path.join(app.directory, 'requirements.txt');
         const vendor = path.join(app.directory, 'vendor');
-        streamProcess(python, ['-m', 'pip', 'install', '-r', requirements, '--target', vendor], app.directory, emit)
+        installPythonRequirements(python, requirements, vendor, emit)
           .then(async (code) => {
             if (code === 0) {
               await updateAppStatus(app.id, 'stopped');
               emit('Install finished successfully');
+              controller.close();
+              return;
+            }
+
+            const requirementsText = await fs.readFile(requirements, 'utf8').catch(() => '');
+            const shouldRetryWithoutVoice = /discord\.py\[voice\]/i.test(requirementsText) || /PyNaCl/i.test(requirementsText);
+
+            if (shouldRetryWithoutVoice) {
+              emit('Retrying install without voice extras to avoid PyNaCl build issues');
+              const fallbackRequirements = await createPythonFallbackRequirements(requirements);
+              const retryCode = await streamProcess(
+                python,
+                ['-m', 'pip', 'install', '--prefer-binary', '-r', fallbackRequirements, '--target', vendor],
+                path.dirname(requirements),
+                emit
+              );
+
+              await fs.unlink(fallbackRequirements).catch(() => undefined);
+
+              if (retryCode === 0) {
+                await updateAppStatus(app.id, 'stopped');
+                emit('Install finished successfully');
+                controller.close();
+                return;
+              }
+
+              await updateAppStatus(app.id, 'error');
+              emit(`Install failed with exit code ${retryCode}`);
               controller.close();
               return;
             }
