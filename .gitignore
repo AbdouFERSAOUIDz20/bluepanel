@@ -1,0 +1,7 @@
+.next
+node_modules
+test-upload
+*.zip
+.env
+.env.local
+.DS_Store
